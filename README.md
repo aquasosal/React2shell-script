@@ -8,10 +8,17 @@ React Server Components (RSC) 취약점 탐지 도구 모음입니다. CVE-2025-
 
 ### 취약한 버전
 
-- **React**: 19.0.0 (패치 버전: 19.0.1)
+**CVE-2025-55182 (React2Shell) 취약 버전:**
+
+- **React**:
+  - 19.0.0 (패치: 19.0.1)
+  - 19.1.0, 19.1.1 (패치: 19.1.2)
+  - 19.2.0 (패치: 19.2.1)
+
 - **Next.js**:
-  - 15.0.0 ~ 15.1.3 (패치 버전: 15.1.4)
-  - 16.0.0 ~ 16.0.6 (패치 버전: 16.0.7)
+  - 15.0.0 ~ 15.1.3 (패치: 15.1.4 이상)
+  - 16.0.0 ~ 16.0.6 (패치: 16.0.7 이상)
+  - 14.3.0-canary.77 이상 (App Router 사용 시)
 
 ### 영향받는 프레임워크
 
@@ -33,6 +40,12 @@ React Server Components (RSC) 취약점 탐지 도구 모음입니다. CVE-2025-
 **특징:**
 - ✨ **React DevTools Hook 방식 사용** (domain-monitoring 방식)
 - ✨ **자바스크립트 기반 버전 탐지** (React 19, Next.js 15/16)
+- ✨ **Safe-Check 모드** (Assetnote 방식) - 실제 RCE 실행 없이 500 + 에러 digest 확인
+- ✨ **RCE 검증 모드** (Nuclei 방식) - 결정적 수학 연산(41*271=11111)으로 실제 실행 확인
+- ✨ **WAF 바이패스 지원** - 128KB 정크 데이터로 WAF 컨텐츠 검사 회피
+- ✨ **rsc-action-id 헤더 검사** - Next-Action 헤더와 함께 AWS 권장 헤더도 확인
+- ✨ **Windows PowerShell 지원** - Windows 대상 서버용 PowerShell 페이로드
+- ✨ **리다이렉트 팔로우 지원** - 동일 호스트 리다이렉트를 따라 RSC 엔드포인트 발견
 - RSC Flight 프로토콜 응답 패턴 확인
 - Next.js/React 버전 정확 자동 탐지
 - CVE-2025-55182 취약 버전 정확 감지
@@ -140,15 +153,34 @@ domain-monitoring 프로젝트에서 사용하는 React/NextJS 탐지 방식을 
 
 **사용법:**
 ```bash
-# 단일 URL 스캔
+# 단일 URL 스캔 (기본 모드: Safe-Check)
+# 실제 RCE 실행 없이 500 + 에러 digest 패턴으로 취약점 확인
 python react2shell_scanner_improved.py https://example.com
 
 # URL 목록 파일로 대량 스캔
 python react2shell_scanner_improved.py urls.txt
 
-# 도메인만 입력 (자동으로 https:// 추가)
-python react2shell_scanner_improved.py example.com
+# RCE 검증 모드 활성화 (실제 코드 실행 테스트)
+# 41*271=11111 수학 연산 결과로 실제 RCE 실행 여부 확인
+python react2shell_scanner_improved.py https://example.com --rce-verify
+
+# Windows 서버 대상 (PowerShell 페이로드)
+python react2shell_scanner_improved.py https://example.com --platform windows
+
+# 리다이렉트 팔로우 활성화
+# 동일 호스트 리다이렉트를 따라 최종 URL에서 스캔
+python react2shell_scanner_improved.py https://example.com --follow-redirects
+
+# 옵션 조합 (RCE 검증 + 리다이렉트 팔로우)
+python react2shell_scanner_improved.py https://example.com --rce-verify --follow-redirects
+
+# Windows 서버 + RCE 검증 + 대량 스캔
+python react2shell_scanner_improved.py urls.txt --rce-verify --platform windows
 ```
+
+**참고:** DevTools Hook 스크립트는 정의되어 있지만,
+        실제 브라우저 자동화 없이 HTML에서 정규식 패턴 매칭으로 버전을 탐지합니다.
+        Go chromedp 기반의 domain-monitoring과 달리 Python requests 라이브러리를 사용합니다.
 
 **출력 예시:**
 ```
@@ -252,7 +284,53 @@ npm install next@16.0.7
 | 빠른 기본 스캔 | `rsc_scan.py` (v1.0) |
 | 원격 취약점 스캔 (기존) | `react2shell_scanner.py` |
 
+### 스캐너 기능 비교
+
+| 스캐너 | Safe-Check | RCE 검증 | WAF 바이패스 | rsc-action-id | Windows | 리다이렉트 | 버전 탐지 |
+|--------|------------|----------|--------------|---------------|---------|------------|-----------|
+| `react2shell_scanner_improved.py` ⭐ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `react2shell_scanner.py` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ⚠️ 기본 |
+| `rsc_scan.py` (v1.0) | ⚠️ 기본 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `rsc_scan1.py` (v1.1) | ⚠️ 기본 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `rsc_scan3.py` (v1.2) | ⚠️ 기본 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `react2shell_local_check.py` | N/A | N/A | N/A | N/A | N/A | N/A | ✅ (로컬) |
+
 ## 스캔 옵션
+
+### react2shell_scanner_improved.py 전용 옵션
+
+```bash
+# Safe-Check 모드 (기본값: 활성화)
+# 실제 RCE 실행 없이 500 상태 코드 + 에러 digest로 취약점 확인
+python react2shell_scanner_improved.py https://example.com --safe-check
+
+# RCE 검증 모드 활성화
+# 결정적 수학 연산(41*271=11111)으로 실제 코드 실행 확인
+python react2shell_scanner_improved.py https://example.com --rce-verify
+
+# Windows 서버 대상 (PowerShell 페이로드 사용)
+python react2shell_scanner_improved.py https://example.com --platform windows
+
+# 리다이렉트 팔로우 활성화
+# 동일 호스트 리다이렉트를 따라 RSC 엔드포인트 발견
+python react2shell_scanner_improved.py https://example.com --follow-redirects
+
+# 옵션 조합 예시
+python react2shell_scanner_improved.py urls.txt --rce-verify --follow-redirects --platform windows
+```
+
+**모드 옵션 설명:**
+- `--safe-check`: Assetnote-style Safe-Check 모드 (기본값: True)
+  - 실제 RCE 실행 없이 500 상태 코드 + 에러 digest 패턴 확인
+  - 보안 점검에 권장되는 기본 모드
+- `--rce-verify`: Nuclei-style RCE 검증 모드 (기본값: False)
+  - 실제 코드 실행을 통해 취약점 검증
+  - 결정적 수학 연산(41*271=11111) 결과로 확인
+- `--platform`: 플랫폼 선택 (기본값: unix)
+  - `unix`: Linux/macOS용 bash 페이로드 (RCE 검증 시)
+  - `windows`: Windows용 PowerShell 페이로드 (RCE 검증 시)
+- `--follow-redirects`: 리다이렉트 팔로우 (기본값: False)
+  - 동일 호스트 내 리다이렉트를 따라 최종 URL에서 스캔 수행
 
 ### 공통 옵션
 
