@@ -23,16 +23,19 @@ React Server Components (RSC) 취약점 탐지 도구 모음입니다. CVE-2025-
 
 ## 스캐너 종류
 
-이 저장소는 5가지 스캐너를 제공합니다:
+이 저장소는 6가지 스캐너를 제공합니다:
 
-### 1. react2shell_scanner.py
-**원격 시스템 취약점 스캐너** (권장)
+### 1. react2shell_scanner_improved.py ⭐ **최신 개선 버전 (권장)**
+**domain-monitoring 방식 통합 - React DevTools Hook 사용**
 
 외부 URL에서 RSC 엔드포인트와 취약한 버전을 탐지합니다.
 
 **특징:**
+- ✨ **React DevTools Hook 방식 사용** (domain-monitoring 방식)
+- ✨ **자바스크립트 기반 버전 탐지** (React 19, Next.js 15/16)
 - RSC Flight 프로토콜 응답 패턴 확인
-- Next.js/React 버전 자동 탐지
+- Next.js/React 버전 정확 자동 탐지
+- CVE-2025-55182 취약 버전 정확 감지
 - 멀티스레드 대량 스캔 지원
 - JSON 보고서 생성
 
@@ -109,21 +112,49 @@ python rsc_scan1.py https://example.com
 python rsc_scan1.py urls.txt -o result.json
 ```
 
-### 5. rsc_scan3.py (v1.2)
-**최신 RSC 탐지 스캐너 - 다중 경로 스캔** (가장 권장)
+### 6. react2shell_scanner_improved.py ⭐ **최신 개선 버전**
+**domain-monitoring 방식 통합 - React DevTools Hook 사용**
 
-Nuclei 템플릿 기반으로 개선된 최신 버전입니다.
+CVE-2025-55182 (React2Shell) 취약점 탐지 스캐너입니다.
+domain-monitoring 프로젝트에서 사용하는 React/NextJS 탐지 방식을 통합하여 더 정확한 결과를 제공합니다.
 
-**v1.2 개선사항:**
-- 다중 경로 RSC 엔드포인트 스캔: `/`, `/_rsc`, `/app`, `/server`, `/api`, `/actions`
-- RSC 에러 메시지 패턴 탐지 추가
-- URL 목록 파일 로드 시 특수문자 정리 기능
-- HTTPS/HTTP 자동 시도
+**개선사항 (domain-monitoring 방식 통합):**
+- ✨ **React DevTools Hook 방식 도입**
+  - `__REACT_DEVTOOLS_GLOBAL_HOOK__` 주입 패턴 사용
+  - React DevTools와 동일한 방식으로 버전 탐지
+- ✨ **자바스크립트 기반 버전 탐지**
+  - React 19: `window.React.version`, DevTools Hook 사용
+  - Next.js: `__NEXT_DATA__`, webpack.js 내부 버전 패턴
+- ✨ **CVE-2025-55182 취약 버전 정확 감지**
+  - React 19.0.0 (패치: 19.0.1)
+  - Next.js 15.0.0 ~ 15.1.3 (패치: 15.1.4)
+  - Next.js 16.0.0 ~ 16.0.6 (패치: 16.0.7)
+- ✨ **domain-monitoring 패턴 통합**
+  - React root div: `<div id="root">`, `<div id="__next">`
+  - Next.js assets: `/_next/`, `/_next/static/`
+  - RSC error patterns: `E{"digest"`
+- RSC Flight 프로토콜 응답 패턴 확인
+- Next.js/React 버전 정확 자동 탐지
+- 멀티스레드 대량 스캔 지원
+- JSON 보고서 생성
 
 **사용법:**
 ```bash
-python rsc_scan3.py https://example.com
-python rsc_scan3.py urls.txt -o result.json -t 20
+# 단일 URL 스캔
+python react2shell_scanner_improved.py https://example.com
+
+# URL 목록 파일로 대량 스캔
+python react2shell_scanner_improved.py urls.txt
+
+# 도메인만 입력 (자동으로 https:// 추가)
+python react2shell_scanner_improved.py example.com
+```
+
+**출력 예시:**
+```
+🔴 [VULNERABLE] https://vulnerable-site.com
+   └─ VULNERABLE Next.js version: 15.1.2
+   └─ React 19.0.0 detected via DevTools Hook
 ```
 
 ## 설치
@@ -213,11 +244,13 @@ npm install next@16.0.7
 
 | 목적 | 권장 스캐너 |
 |------|------------|
-| 외부 사이트 스캔 (가장 정확) | `rsc_scan3.py` (v1.2) |
-| 취약 버전 확인 포함 | `react2shell_scanner.py` |
+| **외부 사이트 스캔 (가장 정확/권장)** | `react2shell_scanner_improved.py` ⭐ |
+| 취약 버전 확인 포함 | `react2shell_scanner_improved.py` ⭐ |
+| RSC 탐지 (다중 경로) | `rsc_scan3.py` (v1.2) |
 | 로컬 프로젝트 점검 | `react2shell_local_check.py` |
 | Pages Router 구분 필요 | `rsc_scan1.py` (v1.1) |
 | 빠른 기본 스캔 | `rsc_scan.py` (v1.0) |
+| 원격 취약점 스캔 (기존) | `react2shell_scanner.py` |
 
 ## 스캔 옵션
 
