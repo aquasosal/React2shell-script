@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 """
 CVE-2025-55182 (React2Shell) 내부 시스템 취약점 확인 스크립트 (개선됨)
-용도: 내부 보안 점검용 (인가된 시스템만 대상으로 사용)
+ 용도: 내부 보안 점검용 (인가된 시스템만 대상으로 사용)
 
  개선사항:
- - React DevTools Hook 방식 사용 (domain-monitoring 방식)
- - React 19/Next.js 15, 16 취약 버전 정확 감지
- - 자바스크립트 기반 버전 탐지
- - Safe-Check 모드 (Assetnote 방식)
- - RCE 검증 모드 (Nuclei 방식)
- - WAF 바이패스 지원
- - rsc-action-id 헤더 검사
- - Windows PowerShell 지원
- - 리다이렉트 팔로우 지원
+  - React DevTools Hook 방식 사용 (domain-monitoring 방식)
+  - React 19/Next.js 15, 16 취약 버전 정확 감지
+  - 자바스크립트 기반 버전 탐지
+  - Playwright 브라우저 자동화 사용 (실제 JavaScript 실행)
+  - Safe-Check 모드 (Assetnote 방식)
+  - RCE 검증 모드 (Nuclei 방식)
+  - WAF 바이패스 지원
+  - rsc-action-id 헤더 검사
+  - Windows PowerShell 지원
+  - 리다이렉트 팔로우 지원
 
-참고: DevTools Hook 스크립트는 정의되어 있지만,
-        실제 브라우저 자동화 없이 HTML에서 정규식 패턴 매칭으로 버전을 탐지합니다.
-        Go chromedp 기반의 domain-monitoring과 달리 Python requests 라이브러리를 사용합니다.
-
-확인 항목:
-  1. React/Next.js 버전 확인 (취약 버전 여부)
-  2. React Server Components 엔드포인트 존재 여부
-  3. RSC Flight 프로토콜 응답 패턴 확인
-"""
+ 확인 항목:
+   1. React/Next.js 버전 확인 (취약 버전 여부)
+   2. React Server Components 엔드포인트 존재 여부
+   3. RSC Flight 프로토콜 응답 패턴 확인
+ """
 
 import requests
 import sys
@@ -35,6 +32,12 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urlparse
+
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
 # SSL 경고 무시 (내부망 자체서명 인증서 대응)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -377,6 +380,69 @@ def extract_react_version_from_html(html):
     return version
 
 
+def check_react_via_browser(url, timeout=10):
+    """Playwright 브라우저 자동화로 React/Next.js 버전 탐지"""
+    results = {
+        'react_detected': False,
+        'nextjs_detected': False,
+        'react_version': '',
+        'nextjs_version': '',
+        'method': 'browser_automation'
+    }
+
+    if not PLAYWRIGHT_AVAILABLE:
+        return {'error': 'Playwright not installed'}
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_default_timeout(timeout * 1000)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+
+            react_version = page.evaluate('''
+                if (window.__REACT_DEVTOOLS_GLOBAL_HOOK__?.renderers) {
+                    const renderers = Array.from(window.__REACT_DEVTOOLS_GLOBAL_HOOK__.renderers.values());
+                    for (const renderer of renderers) {
+                        if (renderer.version) {
+                            return renderer.version;
+                        }
+                    }
+                }
+                if (window.React && window.React.version) {
+                    return window.React.version;
+                }
+                return null;
+            ''')
+
+            nextjs_version = page.evaluate('window.next?.version || null')
+
+            if react_version:
+                results['react_detected'] = True
+                results['react_version'] = react_version
+                results['indicators'].append(f"React version (DevTools Hook): {react_version}")
+
+            if nextjs_version:
+                results['nextjs_detected'] = True
+                results['nextjs_version'] = nextjs_version
+                results['indicators'].append(f"Next.js version (window.next): {nextjs_version}")
+
+            if not react_version and not nextjs_version:
+                results['nextjs_detected'] = bool(page.evaluate('window.__NEXT_DATA__'))
+                results['react_detected'] = bool(page.evaluate('!!document.getElementById("root") || !!document.getElementById("__next")'))
+
+            if not results['react_version'] and not results['nextjs_version']:
+                results['indicators'].append("Browser automation: No version detected via window object")
+
+            browser.close()
+    except Exception as e:
+        results['error'] = f'{type(e).__name__}: {str(e)[:100]}'
+        results['indicators'].append(f"Browser automation failed: {results['error']}")
+
+    return results
+
+
 def check_react_via_javascript(session, url, timeout=10):
     """자바스크립트 실행으로 React/Next.js 버전 탐지 (domain-monitoring 방식)"""
     results = {
@@ -388,7 +454,6 @@ def check_react_via_javascript(session, url, timeout=10):
     }
 
     try:
-        # React DevTools Hook 주입 요청
         resp = session.get(
             url,
             timeout=timeout,
@@ -401,12 +466,8 @@ def check_react_via_javascript(session, url, timeout=10):
 
         html = resp.text
 
-        # React DevTools Hook 주입 + 버전 탐지를 위해 스크립트 실행
-        # 실제 브라우저 자동화 없이 HTML에서 React 버전 패턴 추출
-
-        # React 19 버전 패턴 (npm 패키지 이름 기반)
         react_patterns = [
-            r'/react@([0-9.]+)/',  # CDN에서 React 19 버전
+            r'/react@([0-9.]+)/',
             r'/react\.production\.(?:min\.)?js',
             r'/react-dom\.(?:min\.)?js',
             r'window\.React\.version\s*=\s*["\']([0-9.]+)["\']',
@@ -422,9 +483,8 @@ def check_react_via_javascript(session, url, timeout=10):
                 else:
                     results['react_detected'] = True
 
-        # Next.js 버전 패턴
         nextjs_patterns = [
-            r'next[/\\]([0-9.]+)',  # webpack.js 내부
+            r'next[/\\]([0-9.]+)',
             r'"next"\s*:\s*"([0-9.]+)"',
             r'"nextVersion"\s*:\s*"([0-9.]+)"',
         ]
@@ -436,11 +496,9 @@ def check_react_via_javascript(session, url, timeout=10):
                 results['nextjs_version'] = match.group(1)
                 break
 
-        # __NEXT_DATA__ 감지 (Next.js App Router)
         if '__NEXT_DATA__' in html or '/_next/' in html:
             results['nextjs_detected'] = True
 
-        # React root div 감지
         if '<div id="root">' in html or '<div id="__next">' in html:
             results['react_detected'] = True
 
@@ -499,12 +557,15 @@ def check_rsc_endpoint(url, timeout=10, safe_check=True, rce_verify=False, follo
         if "/_next/" in resp.text:
             results["indicators"].append("Next.js asset path detected")
 
-        # 2. 자바스크립트 기반 React/Next.js 버전 탐지 (개선됨)
-        js_detection = check_react_via_javascript(
-            requests.Session(),
-            url,
-            timeout
-        )
+        # 2. 브라우저 자동화로 React/Next.js 버전 탐지 (Playwright)
+        if PLAYWRIGHT_AVAILABLE:
+            js_detection = check_react_via_browser(url, timeout)
+        else:
+            js_detection = check_react_via_javascript(
+                requests.Session(),
+                url,
+                timeout
+            )
 
         if js_detection.get('react_version'):
             results["version_info"]["react"] = js_detection['react_version']
