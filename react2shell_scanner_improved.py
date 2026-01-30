@@ -387,7 +387,8 @@ def check_react_via_browser(url, timeout=10):
         'nextjs_detected': False,
         'react_version': '',
         'nextjs_version': '',
-        'method': 'browser_automation'
+        'method': 'browser_automation',
+        'indicators': []
     }
 
     if not PLAYWRIGHT_AVAILABLE:
@@ -395,13 +396,24 @@ def check_react_via_browser(url, timeout=10):
 
     try:
         from playwright.sync_api import sync_playwright
+        import time as time_module
+
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.set_default_timeout(timeout * 1000)
+
+            # CRITICAL: Inject DevTools hooks BEFORE page loads
+            # This is how browser DevTools actually work!
+            page.add_init_script(REACT_DEVTOOLS_HOOK)
+
+            # Now navigate - React will see our hook and register itself
             page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
 
-            react_version = page.evaluate('''
+            # Wait for React to fully initialize and register with our hook
+            time_module.sleep(3)
+
+            react_version = page.evaluate('''() => {
                 if (window.__REACT_DEVTOOLS_GLOBAL_HOOK__?.renderers) {
                     const renderers = Array.from(window.__REACT_DEVTOOLS_GLOBAL_HOOK__.renderers.values());
                     for (const renderer of renderers) {
@@ -414,9 +426,9 @@ def check_react_via_browser(url, timeout=10):
                     return window.React.version;
                 }
                 return null;
-            ''')
+            }''')
 
-            nextjs_version = page.evaluate('window.next?.version || null')
+            nextjs_version = page.evaluate('() => window.next?.version || null')
 
             if react_version:
                 results['react_detected'] = True
@@ -429,8 +441,8 @@ def check_react_via_browser(url, timeout=10):
                 results['indicators'].append(f"Next.js version (window.next): {nextjs_version}")
 
             if not react_version and not nextjs_version:
-                results['nextjs_detected'] = bool(page.evaluate('window.__NEXT_DATA__'))
-                results['react_detected'] = bool(page.evaluate('!!document.getElementById("root") || !!document.getElementById("__next")'))
+                results['nextjs_detected'] = bool(page.evaluate('() => window.__NEXT_DATA__'))
+                results['react_detected'] = bool(page.evaluate('() => !!document.getElementById("root") || !!document.getElementById("__next")'))
 
             if not results['react_version'] and not results['nextjs_version']:
                 results['indicators'].append("Browser automation: No version detected via window object")
@@ -506,6 +518,53 @@ def check_react_via_javascript(session, url, timeout=10):
         results['error'] = str(e)
 
     return results
+
+
+def extract_nextjs_version_from_chunks(base_url, html_content, timeout=5):
+    """
+    Extract Next.js version from chunk files (domain-monitoring method)
+    Checks up to 8 chunk files with 4 different version patterns
+
+    This function mirrors the Go implementation from domain-monitoring/internal/scanner/cve/fingerprint.go
+    It significantly improves detection accuracy compared to checking only webpack.js
+    """
+    import re
+
+    # 1. Extract all chunk file paths from HTML
+    chunk_pattern = re.compile(r'/_next/static/chunks/([^"\']+\.js)')
+    chunks = chunk_pattern.findall(html_content)
+
+    if not chunks:
+        return None
+
+    # 2. Version patterns (from domain-monitoring fingerprint.go:2077-2164)
+    version_patterns = [
+        r'window\.next\s*=\s*\{\s*version\s*:\s*["\'](\d+\.\d+\.\d+[^"\']*)["\'"]',  # Pattern 0: window.next={version:"14.2.29"}
+        r'["\']next["\']\s*:\s*["\'](\d+\.\d+\.\d+[^"\']*)["\'"]',                    # Pattern 1: "next":"14.2.29"
+        r'next@(\d+\.\d+\.\d+)',                                                       # Pattern 2: next@14.2.29
+        r'name:\s*["\']next["\']\s*,\s*version:\s*["\'](\d+\.\d+\.\d+[^"\']*)["\'"]', # Pattern 3: {name:"next",version:"14.2.29"}
+    ]
+
+    # 3. Check up to 8 chunks (like domain-monitoring)
+    for i, chunk in enumerate(chunks[:8]):
+        chunk_url = f"{base_url.rstrip('/')}/_next/static/chunks/{chunk}"
+        try:
+            resp = requests.get(chunk_url, timeout=timeout, verify=False)
+            if resp.status_code == 200:
+                # Limit content to 300KB like Go version (300 * 1024 bytes)
+                content = resp.text[:307200]
+
+                # Try all patterns
+                for pattern_idx, pattern in enumerate(version_patterns):
+                    match = re.search(pattern, content)
+                    if match:
+                        version = match.group(1)
+                        return version
+        except Exception:
+            # Continue to next chunk if this one fails
+            continue
+
+    return None
 
 
 def check_rsc_endpoint(url, timeout=10, safe_check=True, rce_verify=False, follow_redirects=False, platform="unix"):
@@ -647,22 +706,15 @@ def check_rsc_endpoint(url, timeout=10, safe_check=True, rce_verify=False, follo
                 results["indicators"].append("rsc-action-id error response detected")
                 break
 
-        build_manifest_url = scan_url.rstrip('/') + "/_next/static/chunks/webpack.js"
-        try:
-            manifest_resp = requests.get(
-                build_manifest_url,
-                timeout=5,
-                verify=False
-            )
-            version_match = re.search(r'next[/\\](\d+\.\d+\.\d+)', manifest_resp.text)
-            if version_match:
-                next_version = version_match.group(1)
-                if "next" not in results["version_info"]:
-                    results["version_info"]["next"] = next_version
-                if is_version_vulnerable(next_version, "next"):
-                    results["indicators"].append(f"VULNERABLE Next.js version: {next_version}")
-        except:
-            pass
+        # Next.js 버전 탐지 (domain-monitoring 방식 - 8개 청크 + 4가지 패턴)
+        nextjs_version = extract_nextjs_version_from_chunks(scan_url, resp.text)
+        if nextjs_version:
+            if "next" not in results["version_info"]:
+                results["version_info"]["next"] = nextjs_version
+            if is_version_vulnerable(nextjs_version, "next"):
+                results["indicators"].append(f"VULNERABLE Next.js version: {nextjs_version}")
+            else:
+                results["indicators"].append(f"Next.js version: {nextjs_version}")
 
         # 상태 결정
         if results["rsc_detected"]:
